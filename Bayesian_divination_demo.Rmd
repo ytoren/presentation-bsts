@@ -1,0 +1,262 @@
+---
+title: "Bayesian time series toolkits in R: Prophet & BSTS"
+output: html_notebook
+---
+
+The code below accomapnies the [talk](https://www.meetup.com/Stan-User-Group-Berlin/events/262480224/) that was given for the [Berlin Bayesian](https://www.meetup.com/Stan-User-Group-Berlin/) meetup group on 08/07/2019 in Berlin. This is not a standalone tutorial, but can give you some idea of what to expect when working with both packages. You can find the slides [here](https://docs.google.com/presentation/d/19r3fZi58rkh2-NPUwJS5gWiS1Du8pNzo9d2p2Xrmkek/edit?usp=sharing) and I will upload a full recording video soon :) 
+
+# Setup
+
+```{r, message=FALSE}
+library(tidyverse)
+library(prophet)
+library(bsts)
+library(CausalImpact)
+source('R/bsts_aux_functions.R')
+```
+
+
+# Data
+
+```{r, message=FALSE}
+d <- read_csv('data/generated_data.csv')
+```
+
+The data includes several time series: daily counts of site visitors from 5 sources (`source1-5`) and daily counts of hits from a search engine.
+
+```{r}
+d %>% 
+  mutate(searches = searches / 10) %>%
+  # select(date, starts_with('source')) %>% 
+  gather('source', 'count', -date) %>% 
+  ggplot(aes(x = date, y = count, colour = source)) %>% 
+  +geom_line() %>% 
+  +xlab('') %>% 
+  +ylab('Visitor Counts') %>% 
+  +scale_y_continuous(sec.axis = sec_axis(name = 'Searches', trans = ~ 10 * .)) %>% 
+  +theme(legend.position = 'bottom')
+```
+
+We are interested in making predictions / inference on visitors from `source1`. A glompse at the data shows that 
+
+1. There was an anomaly between 24-29/10 (we had technical problems around a new feature)
+2. After the problems were solved we stabilized on a bew baseline.
+
+Ideally we would like to estimate the damage done during the "dip" we had, and get some understanding what was the new baseline.
+
+```{r}
+dip_dates <- c(start = as.POSIXct('2015-10-24'), end = as.POSIXct('2015-10-29'))
+d %>% 
+  ggplot() %>% 
+  +geom_line(aes(x = date, y = source1)) %>% 
+  +geom_vline(xintercept = dip_dates['start'], colour = 'blue', lty = 2) %>% 
+  +geom_vline(xintercept = dip_dates['end'], colour = 'blue', lty = 2)
+```
+
+
+# Prophet
+
+## Data structure 
+`prophet` requires specific colimn names `y` & `ds` to run properly: 
+
+```{r}
+prophet_data <- d %>% rename(y = source1, ds = date)
+test_window <- 30 # days for testing
+```
+
+
+## Model run 
+Go ahead and try different model setups by un/commenting the different lines (shown below is the most "complex" model). The output is the standard `Stan` output.
+
+```{r message=FALSE, warning=FALSE}
+pr1 <- prophet(
+  ## Manual changes dates
+  changepoints = c(as.POSIXct('2015-10-24'), as.POSIXct('2015-10-29')),
+  # changepoint.prior.scale = 0.5,
+  # interval.width = 3,
+  ## Seasonality
+  weekly.seasonality = TRUE,
+  yearly.seasonality = FALSE,
+  fit = FALSE,
+  mcmc.samples = 1000) %>% 
+  ## Adding regressors
+  add_regressor(name = 'searches') %>%
+  add_regressor(name = 'source2') %>%
+  fit.prophet(
+    prophet_data %>% filter(ds <= max(ds) - test_window * 24 * 3600)
+  )
+```
+
+
+## Analysis
+Out of the box, the `prophet` object allows plotting of model fit to historical & new results (this is a `ggplot2` plot and you can add your own annotations as needed)
+
+```{r warning=FALSE}
+prophet_data_pred <- predict(pr1, prophet_data) %>% 
+  mutate(test = if_else(ds > max(ds) - test_window * 24 * 3600, prophet_data$y, NA_real_))
+
+pr1_plot <- plot(pr1, prophet_data_pred) 
+plot(pr1_plot + geom_point(aes(y = test), col ='red', pch = 4))
+```
+
+Adding change points:
+
+```{r warning=FALSE}
+pr1_plot_ch <- pr1_plot
+for (ch_date in pr1$changepoints) {
+  pr1_plot_ch <- pr1_plot_ch + geom_vline(xintercept = ch_date, colour = 'grey', lty = 2)
+}
+
+plot(pr1_plot_ch + geom_point(aes(y = test), col ='red', pch = 4))
+```
+
+### Model components 
+
+```{r}
+prophet_plot_components(pr1, predict(pr1, prophet_data))
+```
+
+### Backtesting 
+`prohpet` also includes tools to evaluate model performance (backtesting). You can set the initial training period (`initial`), forecast horizon / window size (`horizon`) and spacing between cutoff dates (`period`) and it will run the models and sample:
+
+```{r}
+pr1_cv <- cross_validation(
+  model = pr1, 
+  initial = 30, 
+  horizon = 30, 
+  units = 'days'
+) 
+```
+
+The results of the CV exercise can be used to extract some pre-calculated error metrics:
+
+```{r}
+performance_metrics(pr1_cv) %>% head()
+```
+
+And come with some defauly plots:
+
+```{r}
+plot_cross_validation_metric(pr1_cv, metric = 'mape')
+```
+
+
+# BSTS 
+
+
+## Data structure
+BSTS requires a different data structure: a time series DF from the `zoo` package
+
+```{r}
+bsts_data <- zoo(d %>% dplyr::select(-date), order.by = d %>% pull(date))
+
+bsts_data_train <- bsts_data
+bsts_data_train$source1[index(bsts_data) > max(index(bsts_data)) - test_window * 24 * 3600] <- NA
+bsts_data_test <-  bsts_data[index(bsts_data) >  max(index(bsts_data)) - test_window * 24 * 3600, ] 
+```
+
+
+## Model run
+Fittling the model starts with an empty `list` and chaining the different components of the model, and finally feeding this structure to the `bsts` function where the potential regressors are declared:
+
+```{r}
+b1 <- list() %>% 
+  # AddLocalLevel(y = bsts_data$source1) %>% 
+  AddAr(y = bsts_data_train$source1, lag = 1) %>% 
+  AddRegressionHoliday(
+    y = bsts_data_train$source1, 
+    holiday.list = list(FixedDateHoliday(
+      holiday.name = 'Dip',
+      month = months(dip_dates['start']),
+      day = lubridate::day(dip_dates['start']),
+      days.before = 0,
+      days.after = as.integer(dip_dates['end'] - dip_dates['start'])
+    ))
+  ) %>% 
+  # Weekly cycles
+  AddSeasonal(y = bsts_data_train$source1, nseasons = 7) %>% 
+  bsts(
+    formula = source1 ~ searches + source2 + source3 + source4 + source5 + 1, 
+    data = bsts_data_train,
+    state.specification = ., 
+    niter = 1000
+    # family = 'poisson'
+  )
+b1_burn <- SuggestBurn(0.1, b1)
+```
+
+## Analysis
+`bsts` uses `R`'s default plotting system (and again you can add your annotaion but in a different way). The default plot uses a gradient to show the posterior distribution:
+
+```{r}
+PlotBstsState(b1, style = 'dynamic')
+points(bsts_data_test$source1, col= 'red', pch = 4)
+```
+
+But boxplots might be a bit more informative:
+
+```{r}
+PlotBstsState(b1, style = 'boxplot', pch = '.')
+points(bsts_data_train$source1, col= 'blue', pch = 1)
+points(bsts_data_test$source1, col= 'red', pch = 4)
+```
+
+
+### Backtesting 
+We can run a similar analysis of the day-to-day errors  our model produces (which is a subset of what `prohpet` has, but still useful)
+
+```{r}
+# bsts::bsts.prediction.errors(b1)
+PlotBstsPredictionErrors(b1, burn = b1_burn, main = 'In-sample prediction errors')
+```
+
+Looking into the model
+
+
+```{r}
+plot(b1, 'components')
+```
+
+And a slightly different view (code in the repository for this)
+
+```{r}
+bsts_plot_components(b1)
+```
+
+### Regression components
+
+#### Spike
+
+```{r}
+PlotBstsCoefficients(b1)
+```
+
+#### Slab 
+The intercept noise seems to be where more of the uncertainty 
+
+```{r}
+boxplot(b1$coefficients[-(1:b1_burn),])
+```
+
+Zooming in on the other series:
+
+```{r}
+boxplot(b1$coefficients[, -1])
+```
+
+
+# CausalImpact
+
+We know something has changes on 09/12: for example we launched a campaign that trageted visitors from `source1`. We  want to know what was the impact of this change, but since we can't have a control group, how do we measure the impact? The idea behind `CausalImpacct` is to use the results of a historically-validated model to build the "counter-factual": we simulate "what would have happened" (our model predictions, assuming they are reliable) and compare to what actually happen. Since this is a bayesian model we can observe the posterior distribution of the difference directly:
+
+```{r warning=FALSE}
+cs3 <- CausalImpact(bsts.model = b1, post.period.response = as.integer(bsts_data_test$source1))
+plot(cs3)
+```
+
+And report the results we want to report
+
+```{r}
+print(cs3, 'report')
+```
+
