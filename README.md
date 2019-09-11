@@ -1,4 +1,4 @@
-# Bayesian Divination
+# Bayesian Divination / Talking Bayes to Businesss
 
 ## Time series analysis & forecasting with Bayesian toolkits
 
