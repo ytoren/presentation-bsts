@@ -1,5 +1,7 @@
 # Bayesian Divination / Talking Bayes to Businesss
 
+[Back to my projects page](/)
+
 ## Time series analysis & forecasting with Bayesian toolkits
 
 Presentations about Bayesian structural times series + code presented at the [Berlin Bayesians](https://www.meetup.com/Stan-User-Group-Berlin/events/262480224/) meetup.
